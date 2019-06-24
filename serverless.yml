@@ -1,0 +1,147 @@
+# Event storage backup piepline functions for SNS topic
+
+service: event-backup-pipeline # NOTE: update this with your service name
+#app: your-app-name
+
+provider:
+  name: aws
+  runtime: python3.7
+  memorySize: 128
+  region: ap-southeast-2
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - firehose:*
+      Resource:
+        - !GetAtt BackupStream.Arn
+    - Effect: Allow
+      Action: 
+        - sqs:ReceiveMessage
+        - sqs:DeleteMessage
+        - sqs:GetQueueAttributes
+      Resource: !GetAtt BackupQueue.Arn
+    - Effect: Allow
+      Action:
+        - logs:CreateLogGroup
+        - logs:CreateLogStream
+        - logs:PutLogEvents
+      Resource:
+        - 'arn:aws:logs:*'
+
+plugins:
+  - serverless-python-requirements
+
+package:
+  individually: true
+  exclude:
+    - node_modules/**
+
+custom:
+  stage: ${opt:stage, 'test'}
+  logLevel: ${opt:logLevel, 'INFO'}
+  topicArn: ${opt:topicArn}
+  bucketArn: ${opt:bucketArn}}
+
+functions:
+  event-storage-backup:
+    handler: process_records.handler
+    module: src
+    name: event-storage-backup-${self:custom.stage}
+    events:
+      - sqs:
+          arn: !GetAtt BackupQueue.Arn
+    environment:
+      LOG_LEVEL: ${self:custom.logLevel}
+      FIREHOSE_DELIVERY_STREAM_NAME: !Ref BackupStream
+
+# you can add CloudFormation resource templates here
+resources:
+  Resources:
+    BackupQueue:
+      Type: AWS::SQS::Queue
+
+    BackupSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: sqs
+        Endpoint: !GetAtt BackupQueue.Arn
+        RawMessageDelivery: true
+        TopicArn: ${self:custom.topicArn}
+
+    BackupQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref BackupQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Id: BackupQueuePolicy
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - sns.amazonaws.com
+              Action:
+                - sqs:SendMessage
+              Resource:
+                - !GetAtt BackupQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: ${self:custom.topicArn}
+
+    BackupStream:
+      Type: AWS::KinesisFirehose::DeliveryStream
+      Properties:
+        DeliveryStreamType: DirectPut
+        ExtendedS3DestinationConfiguration:
+          BucketARN: ${self:custom.bucketArn}
+          RoleARN: !GetAtt BackupStreamRole.Arn
+          Prefix: ''
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 5
+          CompressionFormat: UNCOMPRESSED
+
+    BackupStreamRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - firehose.amazonaws.com
+              Action:
+              - sts:AssumeRole
+              Condition:
+                StringEquals:
+                  sts:ExternalId: !Ref AWS::AccountId
+        Policies:
+          - PolicyName: fh-policy
+            PolicyDocument:
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:AbortMultipartUpload
+                    - s3:GetBucketLocation
+                    - s3:GetObject
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                    - s3:PutObject
+                  Resource:
+                    - ${self:custom.bucketArn}
+                    - ${self:custom.bucketArn}/*
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - Fn::Join:
+                      - ':'
+                      - - 'arn'
+                        - !Ref AWS::Partition
+                        - 'logs'
+                        - !Ref AWS::Region
+                        - !Ref AWS::AccountId
+                        - 'log-group:/aws/kinesisfirehose/*'
